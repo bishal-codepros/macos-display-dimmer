@@ -1,0 +1,319 @@
+#!/usr/bin/env python3
+"""Persistent GPU-side brightness for displays that don't honour DDC/CI.
+
+CoreGraphics ties a gamma ramp to the process that set it, so a resident
+holder is unavoidable. Design constraints learned the hard way:
+
+  * The main thread must sit in NSApp.run() to receive screen-change
+    notifications. CFRunLoopRun() does not pump AppKit's event loop, so
+    nothing is delivered; CGDisplayRegisterReconfigurationCallback registers
+    with rc=0 but is likewise never delivered in an unbundled Python process.
+    Both were verified against a real reconfiguration.
+  * While the main thread is inside that loop the interpreter never regains
+    control, so Python-level signal handlers NEVER RUN -- SIGTERM and SIGHUP
+    are silently swallowed and the daemon becomes unkillable.
+  * So control messages arrive over a FIFO read by a worker thread
+    (blocking read, 0% CPU), and SIGTERM is left at SIG_DFL so the kernel
+    can always kill us.
+  * No timers anywhere. Nothing polls.
+"""
+import ctypes, ctypes.util, os, signal, stat, subprocess, sys, threading, time
+
+CFG   = os.path.expanduser("~/.config/dimmer")
+LEVEL = os.path.join(CFG, "level")
+PID   = os.path.join(CFG, "pid")
+FIFO  = os.path.join(CFG, "ctl")
+SELF  = os.path.realpath(__file__)
+# The daemon needs pyobjc (AppKit) for screen-change notifications; the CLI
+# does not, so only the daemon must run under this interpreter.
+VENV_PY = os.path.join(CFG, "venv", "bin", "python")
+os.makedirs(CFG, exist_ok=True)
+
+TRANSITION = 0.30      # seconds; in the range every desktop OS uses
+FPS        = 60
+
+cg = ctypes.CDLL(ctypes.util.find_library("ApplicationServices"))
+cf = ctypes.CDLL(ctypes.util.find_library("CoreFoundation"))
+f  = ctypes.c_float
+Pf = ctypes.POINTER(f)
+cg.CGSetDisplayTransferByFormula.argtypes = [ctypes.c_uint32] + [f]*9
+cg.CGGetDisplayTransferByFormula.argtypes = [ctypes.c_uint32] + [Pf]*9
+cg.CGGetOnlineDisplayList.argtypes = [ctypes.c_uint32,
+    ctypes.POINTER(ctypes.c_uint32), ctypes.POINTER(ctypes.c_uint32)]
+cg.CGDisplayIsBuiltin.argtypes = [ctypes.c_uint32]
+cg.CGDisplayIsAsleep.argtypes  = [ctypes.c_uint32]
+
+LOG = "/tmp/dimmer.log"
+def log(msg):
+    try:
+        with open(LOG, "a") as fh:
+            fh.write(f"{time.strftime('%H:%M:%S')} [{os.getpid()}] {msg}\n")
+    except Exception:
+        pass
+
+def externals():
+    """ONLINE, not ACTIVE. CGGetActiveDisplayList excludes sleeping displays,
+    so with the active list the tool went blind every time the screen slept:
+    `dim 45` answered "no external display found" and the level was lost.
+    A sleeping display is still attached and still owns a gamma ramp."""
+    arr = (ctypes.c_uint32 * 16)(); n = ctypes.c_uint32()
+    cg.CGGetOnlineDisplayList(16, arr, ctypes.byref(n))
+    return [d for d in list(arr)[:n.value] if not cg.CGDisplayIsBuiltin(d)]
+
+def set_gamma(pct):
+    v = max(0.05, min(1.0, pct / 100.0))
+    for d in externals():
+        cg.CGSetDisplayTransferByFormula(d, f(0),f(v),f(1), f(0),f(v),f(1), f(0),f(v),f(1))
+
+def get_gamma(d):
+    """Read the ramp back -- the only honest way to prove a change landed."""
+    vals = [f() for _ in range(9)]
+    cg.CGGetDisplayTransferByFormula(d, *[ctypes.byref(x) for x in vals])
+    return round(vals[1].value * 100, 1)          # redMax, as a percentage
+
+def read_level():
+    try:    return float(open(LEVEL).read().strip())
+    except: return 100.0
+
+# --- daemon discovery: every daemon, not just the pidfile's ------------------
+def daemon_pids():
+    """Our daemons only. Matching on a loose substring is dangerous: any
+    process whose command line merely mentions this path (a grep, an editor,
+    a ps) would match and get SIGKILLed. So require argv to be a python
+    interpreter running exactly SELF with an exact --daemon argument."""
+    out = subprocess.run(["ps", "-eo", "pid=,args="], capture_output=True, text=True).stdout
+    me, pids = os.getpid(), []
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) < 3:
+            continue
+        try: pid = int(parts[0])
+        except ValueError: continue
+        if pid == me:
+            continue
+        argv = parts[1:]
+        if "python" not in os.path.basename(argv[0]).lower():
+            continue                       # not an interpreter -> not ours
+        if SELF not in argv[1:]:
+            continue                       # exact path element, not substring
+        if "--daemon" not in argv[1:]:
+            continue                       # exact flag element
+        pids.append(pid)
+    return pids
+
+def kill_all():
+    """SIGTERM, then SIGKILL anything that survives. Older builds ignored
+    SIGTERM entirely, so the fallback is not optional."""
+    targets = daemon_pids()
+    for p in targets:
+        try: os.kill(p, signal.SIGTERM)
+        except ProcessLookupError: pass
+    if targets:
+        time.sleep(0.4)
+        for p in targets:
+            try:
+                os.kill(p, 0); os.kill(p, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError): pass
+        time.sleep(0.2)
+    return targets
+
+# --- animation ---------------------------------------------------------------
+_st   = {"current": 100.0, "target": 100.0, "gen": 0}
+_lock = threading.Lock()
+_wake = threading.Event()
+
+def _ease(t):
+    """Smoothstep: gentle departure and arrival, full use of the duration."""
+    return t * t * (3.0 - 2.0 * t)
+
+def request(target):
+    with _lock:
+        _st["target"] = target; _st["gen"] += 1
+    _wake.set()
+
+def reassert():
+    with _lock:
+        t = _st["target"]; _st["current"] = t
+    set_gamma(t)
+
+_reassert_lock   = threading.Lock()
+_reassert_active = False
+
+def _schedule_reassert():
+    """Re-apply after a screen-parameter change. Two things make a single
+    immediate write insufficient: the notification fires more than once per
+    event, and macOS installs its own default ramp as the display settles --
+    last writer wins. So re-assert a bounded handful of times, debounced.
+    Event-triggered and finite; never a poll loop."""
+    global _reassert_active
+    with _reassert_lock:
+        if _reassert_active:
+            return                       # already covering this event
+        _reassert_active = True
+
+    def worker():
+        global _reassert_active
+        try:
+            for delay in (0.2, 0.8, 2.0, 4.0):
+                time.sleep(delay)
+                reassert()
+                log(f"reassert(+{delay}s) target={read_level()} "
+                    f"readback={[get_gamma(d) for d in externals()]}")
+        finally:
+            with _reassert_lock:
+                _reassert_active = False
+    threading.Thread(target=worker, daemon=True).start()
+
+def _animator():
+    while True:
+        _wake.wait(); _wake.clear()                  # parked: 0% CPU
+        with _lock:
+            gen, start, end = _st["gen"], _st["current"], _st["target"]
+        if abs(end - start) < 0.05:
+            set_gamma(end)
+            with _lock: _st["current"] = end
+            continue
+        steps = max(1, int(TRANSITION * FPS)); t0 = time.perf_counter()
+        for i in range(1, steps + 1):
+            with _lock:
+                if _st["gen"] != gen: break          # superseded; restart
+            cur = start + (end - start) * _ease(i / steps)
+            set_gamma(cur)
+            with _lock: _st["current"] = cur
+            slack = t0 + (i / steps) * TRANSITION - time.perf_counter()
+            if slack > 0: time.sleep(slack)
+        else:
+            set_gamma(end)
+            with _lock: _st["current"] = end
+
+# --- control channel ---------------------------------------------------------
+def ensure_fifo():
+    """The channel must be a real FIFO. If it is missing, open() would raise
+    forever; if it is a regular file, open() returns EOF instantly and the
+    read loop spins at full tilt. Both are silent busy-loops -- so repair the
+    node rather than tolerating either."""
+    if os.path.exists(FIFO) and not stat.S_ISFIFO(os.stat(FIFO).st_mode):
+        os.remove(FIFO)
+    if not os.path.exists(FIFO):
+        os.mkfifo(FIFO, 0o600)
+
+def _reader():
+    """Blocking FIFO reads. Needs no interpreter attention, so it works even
+    though the main thread is parked forever inside NSApp.run().
+
+    No branch here may spin: every failure path either repairs the node or
+    gives up and exits, with bounded backoff in between.
+    """
+    fails = 0
+    while True:
+        try:
+            ensure_fifo()
+            with open(FIFO, "r") as fh:              # blocks until a writer opens
+                for line in fh:
+                    msg = line.strip().split()
+                    if not msg: continue
+                    if msg[0] == "level" and len(msg) > 1:
+                        request(float(msg[1]))
+                    elif msg[0] == "quit":
+                        request(100.0)
+                        time.sleep(TRANSITION + 0.1)  # let the fade finish
+                        os._exit(0)                   # immediate; no unwinding
+            fails = 0                                 # a clean cycle resets
+        except Exception:
+            fails += 1
+            if fails >= 5:
+                os._exit(1)          # unrecoverable: exit rather than spin.
+                                     # macOS restores gamma on process death.
+            time.sleep(0.5 * fails)  # bounded backoff, never a tight loop
+
+def send(msg):
+    """Write a control message. False means nobody is listening."""
+    try:
+        fd = os.open(FIFO, os.O_WRONLY | os.O_NONBLOCK)   # ENXIO if no reader
+    except OSError:
+        return False
+    try:
+        os.write(fd, (msg + "\n").encode()); return True
+    finally:
+        os.close(fd)
+
+# --- daemon ------------------------------------------------------------------
+def run_daemon():
+    signal.signal(signal.SIGTERM, signal.SIG_DFL)   # let the kernel kill us
+    signal.signal(signal.SIGHUP,  signal.SIG_IGN)
+    open(PID, "w").write(str(os.getpid()))
+
+    ensure_fifo()
+
+    threading.Thread(target=_animator, daemon=True).start()
+    threading.Thread(target=_reader,   daemon=True).start()
+    request(read_level())
+
+    # AppKit, imported here rather than at module scope: only the daemon needs
+    # pyobjc, and the CLI runs under the system interpreter which lacks it.
+    import AppKit, objc
+
+    class _Obs(AppKit.NSObject):
+        def screensChanged_(self, note):
+            log(f"screens changed -> {len(AppKit.NSScreen.screens())} screen(s)")
+            _schedule_reassert()
+
+    app = AppKit.NSApplication.sharedApplication()
+    app.setActivationPolicy_(AppKit.NSApplicationActivationPolicyProhibited)
+    obs = _Obs.alloc().init()
+    globals()["_obs_ref"] = obs                     # keep alive
+    AppKit.NSNotificationCenter.defaultCenter().addObserver_selector_name_object_(
+        obs, objc.selector(_Obs.screensChanged_, signature=b"v@:@"),
+        AppKit.NSApplicationDidChangeScreenParametersNotification, None)
+    log(f"daemon start: observer registered, externals={externals()}")
+    # NSApp.run(), NOT CFRunLoopRun(): CFRunLoopRun does not pump AppKit's
+    # event loop, so screen-parameter notifications are never delivered.
+    # CGDisplayRegisterReconfigurationCallback registers fine (rc=0) but is
+    # likewise never delivered in an unbundled Python process -- verified.
+    app.run()
+    log("NSApp.run() RETURNED -- event loop died")
+
+def stop():
+    if not send("quit"):
+        kill_all()
+    else:
+        time.sleep(TRANSITION + 0.35)
+        kill_all()                                  # belt and braces
+    for x in (PID, LEVEL, FIFO):
+        try: os.remove(x)
+        except FileNotFoundError: pass
+    cg.CGDisplayRestoreColorSyncSettings()
+
+if __name__ == "__main__":
+    a = sys.argv[1:]
+    if a and a[0] == "--daemon":
+        run_daemon(); sys.exit(0)
+
+    if not a or a[0] in ("status", "-h", "--help"):
+        live = daemon_pids()
+        print(f"daemon  : {'running pid ' + str(live[0]) if live else 'not running'}")
+        if len(live) > 1: print(f"  WARNING: {len(live)} daemons running: {live}")
+        print(f"level   : {read_level():g}% (requested)")
+        for d in externals():
+            zzz = " (asleep)" if cg.CGDisplayIsAsleep(d) else ""
+            print(f"gamma   : display {d} reports {get_gamma(d):g}%{zzz}   <- read back from CoreGraphics")
+        print(f"fade    : {TRANSITION*1000:.0f} ms, smoothstep")
+        print(f"external: {externals() or 'none'}")
+        print("\nusage: dim <5-100> | dim reset | dim status")
+        sys.exit(0)
+
+    if a[0] in ("reset", "off", "stop"):
+        stop(); print("faded back to 100% (daemon stopped)"); sys.exit(0)
+
+    try: pct = max(5.0, min(100.0, float(a[0])))
+    except ValueError: sys.exit(f"bad level: {a[0]}")
+    if not externals(): sys.exit("no external display found")
+    open(LEVEL, "w").write(str(pct))
+
+    if not send(f"level {pct}"):                    # no daemon listening
+        kill_all()                                  # clear any zombie holders
+        subprocess.Popen(["nohup", VENV_PY if os.path.exists(VENV_PY) else sys.executable, SELF, "--daemon"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL, start_new_session=True)
+        time.sleep(0.6)
+    print(f"external display -> {pct:g}%")
