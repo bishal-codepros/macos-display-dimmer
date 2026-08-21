@@ -18,8 +18,19 @@ if [[ "$(uname)" != "Darwin" ]]; then
     exit 1
 fi
 
-if ! command -v python3 >/dev/null 2>&1; then
-    echo "error: python3 not found" >&2
+# `command -v python3` is not enough: on a clean macOS /usr/bin/python3 is a
+# stub that only prompts to install Command Line Tools. Actually run it.
+if ! python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 8) else 1)' 2>/dev/null; then
+    echo "error: a runnable python3 (3.8+) is required." >&2
+    echo "  On a fresh macOS, /usr/bin/python3 is only a stub until the Command" >&2
+    echo "  Line Tools are installed. Fix with either:" >&2
+    echo "      xcode-select --install" >&2
+    echo "      brew install python" >&2
+    exit 1
+fi
+
+if ! python3 -c 'import venv' 2>/dev/null; then
+    echo "error: the python3 'venv' module is missing; cannot build the daemon venv." >&2
     exit 1
 fi
 
@@ -85,17 +96,40 @@ PLIST_EOF
 plutil -lint "$PLIST"
 launchctl bootstrap "gui/$UID_NUM" "$PLIST"
 
-# Shell alias, for whichever rc file exists.
-ALIAS="alias dim='python3 \$HOME/bin/dimmer.py'"
-for rc in "$HOME/.zshrc" "$HOME/.bashrc"; do
-    [[ -f "$rc" ]] || continue
-    if grep -q "alias dim=" "$rc"; then
-        echo "==> alias already present in $rc"
-    else
-        printf '\n%s\n' "$ALIAS" >> "$rc"
-        echo "==> added alias to $rc"
-    fi
-done
+# Shell alias. Pick the rc file for the user's ACTUAL shell and create it if
+# absent -- a fresh macOS account often has no ~/.zshrc at all, and the old
+# "only if the file already exists" loop silently installed no alias and said
+# nothing about it. macOS bash login shells read .bash_profile, not .bashrc.
+SHELL_NAME="$(basename "${SHELL:-/bin/zsh}")"
+case "$SHELL_NAME" in
+    zsh)
+        RC="$HOME/.zshrc"
+        ALIAS_LINE="alias dim='python3 \$HOME/bin/dimmer.py'"
+        ;;
+    bash)
+        if [ -f "$HOME/.bashrc" ]; then RC="$HOME/.bashrc"; else RC="$HOME/.bash_profile"; fi
+        ALIAS_LINE="alias dim='python3 \$HOME/bin/dimmer.py'"
+        ;;
+    fish)
+        RC="$HOME/.config/fish/config.fish"
+        mkdir -p "$(dirname "$RC")"
+        ALIAS_LINE="alias dim='python3 \$HOME/bin/dimmer.py'"
+        ;;
+    *)
+        RC=""
+        ;;
+esac
+
+if [ -z "$RC" ]; then
+    echo "==> unrecognised shell '$SHELL_NAME'; add this alias yourself:"
+    echo "      dim -> python3 \$HOME/bin/dimmer.py"
+elif grep -q "alias dim=" "$RC" 2>/dev/null; then
+    echo "==> alias already present in $RC"
+else
+    touch "$RC"
+    printf '\n%s\n' "$ALIAS_LINE" >> "$RC"
+    echo "==> added alias to $RC"
+fi
 
 cat <<'DONE'
 

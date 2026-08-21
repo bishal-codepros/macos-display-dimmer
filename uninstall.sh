@@ -45,7 +45,8 @@ echo "==> script, venv and state removed"
 # repo, so resolve the real path -- `sed -i` refuses to edit a symlink. Only an
 # exact match on the line we wrote is removed; a hand-customised alias is left
 # alone and reported, and nothing else in the file is touched.
-python3 - "$HOME/.zshrc" "$HOME/.bashrc" <<'ALIAS_EOF'
+python3 - "$HOME/.zshrc" "$HOME/.bashrc" "$HOME/.bash_profile" \
+    "$HOME/.config/fish/config.fish" <<'ALIAS_EOF'
 import os, re, sys
 
 PATTERN = re.compile(r"^alias dim='python3 (\$HOME|~)/bin/dimmer\.py'$")

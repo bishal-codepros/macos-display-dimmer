@@ -65,12 +65,42 @@ forwards EDID at `0x50` but nothing at `0x37`.
 
 ## Requirements
 
-- macOS (Apple Silicon or Intel)
-- `python3`
-- An external display
+- **macOS 11 Big Sur or later.** `launchctl bootstrap gui/` needs 10.11+; the
+  rest is older still. Developed and tested on macOS 26.6.2, Apple Silicon
+  (`arm64`). **Intel is untested** — the CoreGraphics gamma API is
+  architecture-independent and pyobjc ships `x86_64` wheels, so it should work,
+  but nobody has run it. Report back if you try.
+- **A runnable `python3`, 3.8 or newer.** On a clean macOS, `/usr/bin/python3`
+  is only a stub that prompts to install the Command Line Tools — `install.sh`
+  actually executes python to catch this rather than just checking the path. Fix
+  with `xcode-select --install` or `brew install python`.
+- **Network access on first install**, to `pip install pyobjc-framework-Cocoa`
+  into an isolated venv at `~/.config/dimmer/venv`. Nothing is installed into
+  your system or Homebrew Python.
+- **An external display.** Nothing here touches the built-in panel — macOS
+  already controls that backlight properly.
 
-`install.sh` builds an isolated venv with `pyobjc-framework-Cocoa`. Nothing is
-installed into your system or Homebrew Python.
+### Shells
+
+`install.sh` adds a `dim` alias to the rc file for your actual `$SHELL`,
+creating it if needed:
+
+| Shell | File |
+|---|---|
+| zsh (macOS default) | `~/.zshrc` |
+| bash | `~/.bashrc` if present, else `~/.bash_profile` (what macOS login shells read) |
+| fish | `~/.config/fish/config.fish` |
+
+Anything else and it prints the alias for you to add by hand. `uninstall.sh`
+removes it from all four locations, resolving symlinks first — rc files are
+often symlinked into a dotfiles repo, and `sed -i` refuses to edit a symlink.
+
+The alias keeps `$HOME` unexpanded on purpose: single quotes stop it expanding
+when the alias is *defined*, and the shell expands it when the alias is *used*,
+so the same line works for any user.
+
+The scripts are `bash` but only use constructs valid in **bash 3.2**, which is
+what macOS ships — no bash-4 syntax, no `readlink -f` (absent before 12.3).
 
 ## Install
 
