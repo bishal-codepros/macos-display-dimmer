@@ -41,10 +41,45 @@ rm -rf "$CFG"
 rm -f /tmp/dimmer.log /tmp/dimmer.out /tmp/dimmer.err
 echo "==> script, venv and state removed"
 
+# Remove the alias we added. Note rc files are often symlinks into a dotfiles
+# repo, so resolve the real path -- `sed -i` refuses to edit a symlink. Only an
+# exact match on the line we wrote is removed; a hand-customised alias is left
+# alone and reported, and nothing else in the file is touched.
+python3 - "$HOME/.zshrc" "$HOME/.bashrc" <<'ALIAS_EOF'
+import os, re, sys
+
+PATTERN = re.compile(r"^alias dim='python3 (\$HOME|~)/bin/dimmer\.py'$")
+for raw in sys.argv[1:]:
+    if not os.path.exists(raw):
+        continue
+    path = os.path.realpath(raw)          # follow dotfiles symlinks
+    try:
+        lines = open(path).readlines()
+    except OSError as e:
+        print(f"==> could not read {path}: {e}")
+        continue
+    kept, removed, custom = [], 0, []
+    for line in lines:
+        stripped = line.rstrip("\n")
+        if PATTERN.match(stripped.strip()):
+            removed += 1
+            continue
+        if stripped.strip().startswith("alias dim="):
+            custom.append(stripped.strip())
+        kept.append(line)
+    if removed:
+        while kept and kept[-1].strip() == "":
+            kept.pop()
+        if kept:
+            kept[-1] = kept[-1].rstrip("\n") + "\n"
+        open(path, "w").writelines(kept)
+        print(f"==> removed alias from {path}")
+    if custom:
+        print(f"==> left a customised alias in {path}: {custom[0]}")
+ALIAS_EOF
+
 cat <<'DONE'
 
-Uninstalled. Remove the alias line yourself if you want it gone:
-
-  grep -n "alias dim=" ~/.zshrc ~/.bashrc 2>/dev/null
+Uninstalled. Open a new shell to drop the `dim` alias from your session.
 
 DONE
