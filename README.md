@@ -110,7 +110,35 @@ cd macos-display-dimmer
 ./install.sh
 ```
 
-Then open a new shell.
+Then open a new shell (or `source` your rc file) to pick up the `dim` alias.
+
+### What it puts on your machine
+
+| Path | What |
+|---|---|
+| `~/bin/dimmer.py` | the script (a **copy** — see below) |
+| `~/.config/dimmer/venv/` | isolated venv holding pyobjc |
+| `~/.config/dimmer/level` | the saved level; deleted by `dim reset` |
+| `~/.config/dimmer/pid` | the running daemon's pid |
+| `~/.config/dimmer/ctl` | FIFO the CLI uses to talk to the daemon |
+| `~/Library/LaunchAgents/com.dimmer.agent.plist` | starts the daemon at login |
+| your shell rc file | the `dim` alias |
+| `/tmp/dimmer.{log,out,err}` | daemon log and launchd stdio |
+
+Nothing is installed system-wide, nothing needs `sudo`, and your system and
+Homebrew Python are left alone.
+
+`install.sh` is safe to re-run: it stops any existing daemon first (a leftover
+holder from an earlier install otherwise fights the new one over the gamma
+table) and retires the old launchd agent before registering the new one.
+
+> **Editing the code:** `~/bin/dimmer.py` is a copy made by the installer. Edit
+> the repo and re-run `./install.sh`; changes made directly to `~/bin` are
+> silently overwritten on the next install.
+
+> **If your rc file is a symlink** into a dotfiles repo — common — the alias is
+> appended to the real file, so it shows up as an uncommitted change in that
+> repo. Expected, and `uninstall.sh` cleans it back out.
 
 ## Usage
 
@@ -134,6 +162,17 @@ OSes use. There is deliberately no speed flag. Change `TRANSITION` in
 ```bash
 ./uninstall.sh
 ```
+
+Reverses everything above: fades the display back to 100%, stops the daemon,
+unregisters and deletes the launchd agent, sweeps any stray daemon a previous
+build may have left behind, removes the script, venv, state and logs, and
+deletes the `dim` alias from your rc file.
+
+The alias removal resolves symlinks first (`sed -i` refuses to edit one) and
+matches only the exact line `install.sh` wrote — if you customised your `dim`
+alias it is left alone and reported rather than clobbered.
+
+Open a new shell afterwards to drop `dim` from the current session.
 
 ## How it works
 
@@ -243,6 +282,20 @@ launchctl kickstart -k gui/$(id -u)/com.dimmer.agent
 - Applies one level to **all** external displays; no per-display control.
 - Not on PyPI or Homebrew. Clone and run `install.sh`.
 - Tested on one machine, one monitor, one macOS version. Issues welcome.
+
+## Contributing
+
+Cloning may hand you an **HTTPS** remote even if you cloned with `git@` — some
+git configs rewrite URLs, and HTTPS pushes fail without a credential helper.
+If you plan to push:
+
+```bash
+git remote set-url origin git@github.com:bishal-codepros/macos-display-dimmer.git
+```
+
+Run `python3 tests/test_dimmer.py` before opening a PR. It needs an external
+display attached and briefly changes its resolution to exercise the
+reconfiguration path.
 
 ## License
 
