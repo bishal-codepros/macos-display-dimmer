@@ -34,9 +34,13 @@ if ! python3 -c 'import venv' 2>/dev/null; then
     exit 1
 fi
 
-echo "==> installing dimmer.py -> $BIN/dimmer.py"
+echo "==> installing dimmer.py + ddc.py -> $BIN/"
 mkdir -p "$BIN" "$CFG" "$HOME/Library/LaunchAgents"
 install -m 755 "$SRC/dimmer.py" "$BIN/dimmer.py"
+# ddc.py is imported by dimmer.py, never executed, so it is not +x. It must
+# land in the SAME directory: dimmer.py adds its own directory to sys.path and
+# imports `ddc` from there.
+install -m 644 "$SRC/ddc.py" "$BIN/ddc.py"
 
 # The daemon needs pyobjc for AppKit screen-change notifications. It lives in
 # its own venv so we never touch the system or Homebrew site-packages.
@@ -138,9 +142,11 @@ Installed.
   dim 60        set the external display to 60%
   dim reset     restore full brightness, stop the daemon
   dim status    show requested level vs the gamma read back
+  dim probe     show which backend each display uses, and why
 
 Open a new shell (or `source ~/.zshrc`) to pick up the alias.
 
-Note: this dims on the GPU, not the backlight. See the README for what that
-does and does not mean.
+Run `dim probe` first. Where a monitor answers on DDC/CI this drives its real
+backlight and no daemon is needed. Where it doesn't, it falls back to dimming
+on the GPU, which is not the same thing -- see the README.
 DONE

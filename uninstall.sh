@@ -36,7 +36,7 @@ print(f"==> swept {len(killed)} stray daemon(s)" if killed else "==> no strays")
 SWEEP
 fi
 
-rm -f "$BIN/dimmer.py"
+rm -f "$BIN/dimmer.py" "$BIN/ddc.py"
 rm -rf "$CFG"
 rm -f /tmp/dimmer.log /tmp/dimmer.out /tmp/dimmer.err
 echo "==> script, venv and state removed"
