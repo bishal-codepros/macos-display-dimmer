@@ -67,6 +67,22 @@ time.sleep(0.5)
 check("no daemons after reset", len(dm.daemon_pids()) == 0, f"{dm.daemon_pids()}")
 check("gamma restored to 100%", near(gamma(), 100.0), f"readback={gamma()}")
 
+# ------------------------------------------------------- backend selection
+print("\n-- backend selection (DDC/CI vs gamma) --")
+# Every external display must be handled by exactly one backend. A display that
+# lands in both gets dimmed twice; one that lands in neither is silently ignored.
+_ext, _hw = set(dm.externals()), dm.ddc_capable_ids()
+_gam = set(dm.gamma_targets(refresh=True))
+check("backends partition every external display", _hw | _gam == _ext,
+      f"ext={sorted(_ext)} ddc={sorted(_hw)} gamma={sorted(_gam)}")
+check("no display on both backends", not (_hw & _gam), f"overlap={sorted(_hw & _gam)}")
+check("ddc_capable_ids is a subset of externals", _hw <= _ext, f"{sorted(_hw)}")
+check("probe_report runs without raising", dm.probe_report() in (0, 1))
+# probe() must never claim capability macOS itself denies.
+for _d in _hw:
+    check(f"macOS agrees display {_d} is controllable",
+          dm._ddc.os_can_change_brightness(_d) is not False, "probe says yes, macOS says no")
+
 # ------------------------------------------------------- level application
 print("\n-- level application (readback, not PID) --")
 dim(40)

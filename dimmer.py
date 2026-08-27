@@ -24,6 +24,15 @@ LEVEL = os.path.join(CFG, "level")
 PID   = os.path.join(CFG, "pid")
 FIFO  = os.path.join(CFG, "ctl")
 SELF  = os.path.realpath(__file__)
+# ddc.py sits beside this script; the installer copies both into ~/bin. Our own
+# directory is added explicitly because the test suite loads dimmer.py by path
+# through importlib, which -- unlike running it as a script -- does not put the
+# containing directory on sys.path.
+sys.path.insert(0, os.path.dirname(SELF))
+try:
+    import ddc as _ddc
+except Exception:
+    _ddc = None                 # gamma-only; every DDC path below degrades to a no-op
 # The daemon needs pyobjc (AppKit) for screen-change notifications; the CLI
 # does not, so only the daemon must run under this interpreter.
 VENV_PY = os.path.join(CFG, "venv", "bin", "python")
@@ -60,9 +69,73 @@ def externals():
     cg.CGGetOnlineDisplayList(16, arr, ctypes.byref(n))
     return [d for d in list(arr)[:n.value] if not cg.CGDisplayIsBuiltin(d)]
 
+# --- backend selection -------------------------------------------------------
+# Two ways to dim an external display, in order of preference:
+#   DDC/CI  -- drives the real backlight, the monitor stores the level in its
+#              own NVRAM, and NO resident process is needed.
+#   gamma   -- rescales the GPU transfer table; needs this daemon alive because
+#              CoreGraphics scopes a ramp to the process that set it.
+# A display gets gamma only when DDC cannot drive it. Mixed setups work: each
+# display is handled by whichever backend it actually supports.
+_ddc_ids   = None                  # display IDs on hardware backlight; None = unknown
+_ddc_lock  = threading.Lock()
+
+def ddc_capable_ids(refresh=False):
+    """CG display IDs whose backlight we can really drive. Opens no lasting
+    handles. Cheap after the first call -- ddc.probe() caches its verdict
+    against the monitor's EDID fingerprint, so a swapped monitor re-probes and
+    the same monitor never does."""
+    if _ddc is None:
+        return set()
+    found, avs = set(), _ddc.av_displays()
+    try:
+        for did in externals():
+            m = _ddc.match_cg_display(did, avs)
+            if m is not None and _ddc.probe(m, refresh=refresh).get("capable"):
+                found.add(did)
+    except Exception:
+        return set()                       # never let a DDC fault break gamma
+    finally:
+        for x in avs:
+            x.close()
+    return found
+
+def gamma_targets(refresh=False):
+    """Externals that need gamma: everything DDC cannot drive.
+
+    The animator calls this on every frame of a fade, so the DDC verdict is
+    memoised rather than re-probed. _schedule_reassert() refreshes it on a
+    screen-parameter change, which is the only time the answer can move."""
+    global _ddc_ids
+    with _ddc_lock:
+        if _ddc_ids is None or refresh:
+            _ddc_ids = ddc_capable_ids(refresh=refresh)
+        skip = _ddc_ids
+    return [d for d in externals() if d not in skip]
+
+def apply_ddc(pct):
+    """Set the real backlight wherever it works. Returns the IDs handled."""
+    if _ddc is None:
+        return set()
+    done, avs = set(), _ddc.av_displays()
+    try:
+        for did in externals():
+            m = _ddc.match_cg_display(did, avs)
+            if m is None:
+                continue
+            p = _ddc.probe(m)
+            if p.get("capable") and m.set_brightness(pct, maximum=p.get("max")):
+                done.add(did)
+    except Exception:
+        pass                               # fall through to gamma for everything
+    finally:
+        for x in avs:
+            x.close()
+    return done
+
 def set_gamma(pct):
     v = max(0.05, min(1.0, pct / 100.0))
-    for d in externals():
+    for d in gamma_targets():
         cg.CGSetDisplayTransferByFormula(d, f(0),f(v),f(1), f(0),f(v),f(1), f(0),f(v),f(1))
 
 def get_gamma(d):
@@ -154,11 +227,12 @@ def _schedule_reassert():
     def worker():
         global _reassert_active
         try:
+            gamma_targets(refresh=True)   # a swapped monitor can change backend
             for delay in (0.2, 0.8, 2.0, 4.0):
                 time.sleep(delay)
                 reassert()
                 log(f"reassert(+{delay}s) target={read_level()} "
-                    f"readback={[get_gamma(d) for d in externals()]}")
+                    f"readback={[get_gamma(d) for d in gamma_targets()]}")
         finally:
             with _reassert_lock:
                 _reassert_active = False
@@ -284,25 +358,87 @@ def stop():
         except FileNotFoundError: pass
     cg.CGDisplayRestoreColorSyncSettings()
 
+# --- diagnostics -------------------------------------------------------------
+def probe_report(refresh=False):
+    """Walk the low-level display path and report what is actually true.
+
+    Exists because every layer of this stack reports success while doing
+    nothing: IOAVServiceWriteI2C returns 0 against a display that ignores the
+    write, and a stub responder returns a well-formed empty reply. The only
+    honest evidence is parsed data, so that is what this prints."""
+    print(f"IOAVService     : {'available' if (_ddc and _ddc.AVAILABLE) else 'MISSING'}")
+    if _ddc is None:
+        print("ddc.py not importable -- gamma is the only backend")
+        return 1
+    if not _ddc.AVAILABLE:
+        print("this macOS build does not export the private I2C symbols")
+        return 1
+    avs = _ddc.av_displays()
+    print(f"external AV svcs: {len(avs)}   (DCPAVServiceProxy, Location=External)")
+    ext = externals()
+    if not avs or not ext:
+        print("no external display attached, or the DCP exposes no I2C endpoint")
+        for x in avs:
+            x.close()
+        return 1
+    rc = 1
+    try:
+        for did in ext:
+            m = _ddc.match_cg_display(did, avs)
+            print(f"\ndisplay {did}{' (asleep)' if cg.CGDisplayIsAsleep(did) else ''}")
+            if m is None or not m.info:
+                print("  EDID        : unreadable -- I2C is not reaching this display")
+                print("  backend     : gamma")
+                continue
+            i = m.info
+            print(f"  EDID        : {i['name'] or '?'}  mfg={i['mfg']} "
+                  f"product=0x{i['product']:04x} serial=0x{i['serial']:08x}")
+            p = _ddc.probe(m, refresh=refresh)
+            print(f"  DDC/CI 0x37 : {'YES' if p.get('capable') else 'no'} -- {p['reason']}")
+            osv = _ddc.os_can_change_brightness(did)
+            print(f"  macOS says  : CanChangeBrightness={osv}"
+                  + ("   <- DISAGREES with the probe above" 
+                     if osv is not None and osv != bool(p.get('capable')) else ""))
+            if p.get("capable"):
+                rc = 0
+                print(f"  brightness  : {m.get_brightness()}%  "
+                      f"(VCP 0x10, max {p.get('max')})")
+                print("  backend     : hardware backlight -- no daemon needed")
+            else:
+                print("  backend     : gamma -- software dimming, daemon required")
+    finally:
+        for x in avs:
+            x.close()
+    return rc
+
+
 if __name__ == "__main__":
     a = sys.argv[1:]
     if a and a[0] == "--daemon":
         run_daemon(); sys.exit(0)
+
+    if a and a[0] == "probe":
+        sys.exit(probe_report(refresh=("-r" in a or "--refresh" in a)))
 
     if not a or a[0] in ("status", "-h", "--help"):
         live = daemon_pids()
         print(f"daemon  : {'running pid ' + str(live[0]) if live else 'not running'}")
         if len(live) > 1: print(f"  WARNING: {len(live)} daemons running: {live}")
         print(f"level   : {read_level():g}% (requested)")
+        hw = ddc_capable_ids()
         for d in externals():
             zzz = " (asleep)" if cg.CGDisplayIsAsleep(d) else ""
-            print(f"gamma   : display {d} reports {get_gamma(d):g}%{zzz}   <- read back from CoreGraphics")
-        print(f"fade    : {TRANSITION*1000:.0f} ms, smoothstep")
+            if d in hw:
+                print(f"backlight: display {d} on DDC/CI{zzz}   <- hardware, monitor stores the level")
+            else:
+                print(f"gamma   : display {d} reports {get_gamma(d):g}%{zzz}   <- read back from CoreGraphics")
+        print(f"fade    : {TRANSITION*1000:.0f} ms, smoothstep (gamma only)")
         print(f"external: {externals() or 'none'}")
-        print("\nusage: dim <5-100> | dim reset | dim status")
+        print("\nusage: dim <5-100> | dim reset | dim status | dim probe")
         sys.exit(0)
 
     if a[0] in ("reset", "off", "stop"):
+        apply_ddc(100.0)                            # real backlight back to full
         stop(); print("faded back to 100% (daemon stopped)"); sys.exit(0)
 
     try: pct = max(5.0, min(100.0, float(a[0])))
@@ -310,10 +446,27 @@ if __name__ == "__main__":
     if not externals(): sys.exit("no external display found")
     open(LEVEL, "w").write(str(pct))
 
-    if not send(f"level {pct}"):                    # no daemon listening
-        kill_all()                                  # clear any zombie holders
-        subprocess.Popen(["nohup", VENV_PY if os.path.exists(VENV_PY) else sys.executable, SELF, "--daemon"],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            stdin=subprocess.DEVNULL, start_new_session=True)
-        time.sleep(0.6)
-    print(f"external display -> {pct:g}%")
+    handled    = apply_ddc(pct)                     # hardware backlight first
+    need_gamma = [d for d in externals() if d not in handled]
+
+    if need_gamma:
+        if not send(f"level {pct}"):                # no daemon listening
+            kill_all()                              # clear any zombie holders
+            subprocess.Popen(["nohup", VENV_PY if os.path.exists(VENV_PY) else sys.executable, SELF, "--daemon"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                stdin=subprocess.DEVNULL, start_new_session=True)
+            time.sleep(0.6)
+    elif daemon_pids():
+        # Every display is on its own backlight now, so the gamma holder has
+        # nothing left to hold -- and a stale ramp would darken a display the
+        # monitor is already dimming. Retire it.
+        if not send("quit"):
+            kill_all()
+
+    if handled and need_gamma:
+        print(f"external display -> {pct:g}%  "
+              f"({len(handled)} backlight, {len(need_gamma)} gamma)")
+    elif handled:
+        print(f"external display -> {pct:g}%  (hardware backlight)")
+    else:
+        print(f"external display -> {pct:g}%")
