@@ -16,12 +16,17 @@ display, automatically.
 
 ```bash
 mkdir -p ~/bin ~/.config/dimmer ~/Library/LaunchAgents
-install -m 755 dimmer.py ~/bin/dimmer.py
-install -m 644 ddc.py    ~/bin/ddc.py      # imported by dimmer.py, same dir required
+cp dimmer.py ddc.py ~/bin/     # ddc.py is imported by dimmer.py; same dir required
+chmod 755 ~/bin/dimmer.py
+chmod 644 ~/bin/ddc.py
 
 python3 -m venv ~/.config/dimmer/venv
 ~/.config/dimmer/venv/bin/pip install -r requirements.txt
 ```
+
+Check your shell isn't shadowing those first (`type cp`): `alias cp='cp -i'`
+prompts on overwrite, and `alias install='brew install'` is why this no longer
+uses `install`. Prefix with `\` to bypass an alias.
 
 Alias:
 
@@ -81,6 +86,9 @@ dim probe     # which backend per display, and why (-r re-probes, ignoring cache
 
 Levels clamp to 5–100.
 
+`dim status` run within the 300 ms fade reports the in-flight gamma value, not
+the target. A steady-state mismatch between requested and readback is a bug.
+
 ## Settings
 
 | Where | What |
@@ -94,7 +102,7 @@ Levels clamp to 5–100.
 | Path | What |
 |---|---|
 | `~/bin/dimmer.py`, `~/bin/ddc.py` | the scripts |
-| `~/.config/dimmer/venv/` | venv holding pyobjc |
+| `~/.config/dimmer/venv/` | venv holding pyobjc; the interpreter launchd runs the daemon with |
 | `~/.config/dimmer/level` | saved level; deleted by `dim reset` |
 | `~/.config/dimmer/ddc.json` | cached DDC capability, keyed by EDID fingerprint |
 | `~/.config/dimmer/pid` | running daemon pid |
