@@ -1,0 +1,12 @@
+# Gamma daemon only: AppKit screen-change notifications (NSApp.run() +
+# NSApplicationDidChangeScreenParametersNotification). The CLI and the DDC/CI
+# backend are stdlib ctypes and need nothing here.
+#
+# Install into an isolated venv at ~/.config/dimmer/venv -- dimmer.py launches
+# the daemon with that interpreter when it exists (see VENV_PY in dimmer.py).
+#
+# Python 3.11+ only, so there is no reason to resolve older pyobjc:
+# 12.2.2 is the latest (2026-08-11) and needs 3.10+.
+#
+# Tested with 12.2.2 on Python 3.14.
+pyobjc-framework-Cocoa>=12.2.2

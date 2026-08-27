@@ -19,12 +19,17 @@ holder is unavoidable. Design constraints learned the hard way:
 """
 import ctypes, ctypes.util, os, signal, stat, subprocess, sys, threading, time
 
+# 3.11+ only, matching the pyobjc floor in requirements.txt. install.sh used
+# to gate this; with the script gone the check lives at the entry point.
+if sys.version_info < (3, 11):
+    sys.exit(f"dimmer needs python 3.11+; this is {sys.version.split()[0]}")
+
 CFG   = os.path.expanduser("~/.config/dimmer")
 LEVEL = os.path.join(CFG, "level")
 PID   = os.path.join(CFG, "pid")
 FIFO  = os.path.join(CFG, "ctl")
 SELF  = os.path.realpath(__file__)
-# ddc.py sits beside this script; the installer copies both into ~/bin. Our own
+# ddc.py sits beside this script; setup copies both into ~/bin. Our own
 # directory is added explicitly because the test suite loads dimmer.py by path
 # through importlib, which -- unlike running it as a script -- does not put the
 # containing directory on sys.path.
