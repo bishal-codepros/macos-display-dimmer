@@ -149,29 +149,52 @@ def read_level():
     except: return 100.0
 
 # --- daemon discovery: every daemon, not just the pidfile's ------------------
+def daemon_line_pid(line, self_path=SELF):
+    """pid if this `ps -o pid=,args=` line is one of our daemons, else None.
+
+    Pure, so it can be tested without spawning anything.
+
+    Matching a loose substring is dangerous: any process whose command line
+    merely mentions this path (a grep, an editor, a ps) would match and get
+    SIGKILLed. An earlier version did exactly that.
+
+    But argv cannot be recovered by splitting either. ps joins argv with spaces
+    and gives no way back to the original element boundaries, so a script path
+    containing a space -- `~/Experiment Projects/...` -- shreds into two
+    elements and an exact-element match can NEVER hit. That silently disabled
+    kill_all(): `dim reset` could not stop its own daemon, and holders piled up
+    one per invocation, each fighting the others over the gamma table.
+
+    So anchor on the exact ` <SELF> --daemon` suffix. Spaces survive, and the
+    safety property holds: a grep or editor merely mentioning the path does not
+    end with it."""
+    head, _, rest = line.strip().partition(" ")
+    try:
+        pid = int(head)
+    except ValueError:
+        return None
+    suffix = f" {self_path} --daemon"
+    if not rest.endswith(suffix):
+        return None
+    interp = rest[:-len(suffix)]
+    if "python" not in os.path.basename(interp).lower():
+        return None                        # not an interpreter -> not ours
+    return pid
+
+
 def daemon_pids():
-    """Our daemons only. Matching on a loose substring is dangerous: any
-    process whose command line merely mentions this path (a grep, an editor,
-    a ps) would match and get SIGKILLed. So require argv to be a python
-    interpreter running exactly SELF with an exact --daemon argument."""
-    out = subprocess.run(["ps", "-eo", "pid=,args="], capture_output=True, text=True).stdout
-    me, pids = os.getpid(), []
+    """Every daemon of ours that is currently running, not just the pidfile's.
+
+    -ww stops ps truncating the command line, which would otherwise chop the
+    ` --daemon` suffix off a long interpreter path and hide the process."""
+    out = subprocess.run(["ps", "-e", "-ww", "-o", "pid=,args="],
+                         capture_output=True, text=True).stdout
+    me = os.getpid()
+    pids = []
     for line in out.splitlines():
-        parts = line.split()
-        if len(parts) < 3:
-            continue
-        try: pid = int(parts[0])
-        except ValueError: continue
-        if pid == me:
-            continue
-        argv = parts[1:]
-        if "python" not in os.path.basename(argv[0]).lower():
-            continue                       # not an interpreter -> not ours
-        if SELF not in argv[1:]:
-            continue                       # exact path element, not substring
-        if "--daemon" not in argv[1:]:
-            continue                       # exact flag element
-        pids.append(pid)
+        pid = daemon_line_pid(line)
+        if pid is not None and pid != me:
+            pids.append(pid)
     return pids
 
 def kill_all():
